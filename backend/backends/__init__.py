@@ -586,22 +586,34 @@ def get_stt_backend() -> STTBackend:
     """
     Get or create STT backend instance based on platform.
 
+    Prefers a local whisper.cpp installation (GGML format) when the binary
+    and at least one model file are present, avoiding redundant HF downloads.
+    Falls back to MLX or PyTorch backends otherwise.
+
     Returns:
-        STT backend instance (MLX or PyTorch)
+        STT backend instance
     """
     global _stt_backend
 
     if _stt_backend is None:
-        backend_type = get_backend_type()
+        from .whisper_cpp_backend import WhisperCppSTTBackend, _find_whisper_bin, _find_models_dir, GGML_MODEL_MAP
 
-        if backend_type == "mlx":
-            from .mlx_backend import MLXSTTBackend
+        whisper_bin = _find_whisper_bin()
+        models_dir = _find_models_dir()
+        has_any_ggml = whisper_bin and any(
+            (models_dir / fname).exists() for fname in GGML_MODEL_MAP.values()
+        )
 
-            _stt_backend = MLXSTTBackend()
+        if has_any_ggml:
+            _stt_backend = WhisperCppSTTBackend()
         else:
-            from .pytorch_backend import PyTorchSTTBackend
-
-            _stt_backend = PyTorchSTTBackend()
+            backend_type = get_backend_type()
+            if backend_type == "mlx":
+                from .mlx_backend import MLXSTTBackend
+                _stt_backend = MLXSTTBackend()
+            else:
+                from .pytorch_backend import PyTorchSTTBackend
+                _stt_backend = PyTorchSTTBackend()
 
     return _stt_backend
 

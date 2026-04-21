@@ -41,7 +41,10 @@ if not os.environ.get("HSA_OVERRIDE_GFX_VERSION"):
 if not os.environ.get("MIOPEN_LOG_LEVEL"):
     os.environ["MIOPEN_LOG_LEVEL"] = "4"
 
-import torch
+try:
+    import torch
+except ImportError:
+    torch = None  # type: ignore[assignment]  # GPU detection degrades gracefully without torch
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from urllib.parse import quote
@@ -145,7 +148,7 @@ def _mount_frontend(application: FastAPI) -> None:
 def _get_gpu_status() -> str:
     """Return a human-readable string describing GPU availability."""
     backend_type = get_backend_type()
-    if torch.cuda.is_available():
+    if torch is not None and torch.cuda.is_available():
         from .backends.base import check_cuda_compatibility
 
         device_name = torch.cuda.get_device_name(0)
@@ -158,7 +161,7 @@ def _get_gpu_status() -> str:
         if not compatible:
             label += " [UNSUPPORTED - see logs]"
         return label
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    elif torch is not None and hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return "MPS (Apple Silicon)"
     elif backend_type == "mlx":
         return "Metal (Apple Silicon via MLX)"
@@ -167,7 +170,7 @@ def _get_gpu_status() -> str:
     try:
         import intel_extension_for_pytorch  # noqa: F401
 
-        if hasattr(torch, "xpu") and torch.xpu.is_available():
+        if torch is not None and hasattr(torch, "xpu") and torch.xpu.is_available():
             try:
                 xpu_name = torch.xpu.get_device_name(0)
             except Exception:
