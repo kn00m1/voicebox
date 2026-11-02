@@ -23,7 +23,11 @@ async def transcribe_audio(
     model: str | None = Form(None),
 ):
     """Transcribe audio file to text."""
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+    _allowed_suffixes = {".wav", ".mp3", ".m4a", ".ogg", ".flac", ".aac", ".webm", ".opus"}
+    _upload_suffix = Path(file.filename or "").suffix.lower()
+    _suffix = _upload_suffix if _upload_suffix in _allowed_suffixes else ".wav"
+
+    with tempfile.NamedTemporaryFile(suffix=_suffix, delete=False) as tmp:
         while chunk := await file.read(UPLOAD_CHUNK_SIZE):
             tmp.write(chunk)
         tmp_path = tmp.name

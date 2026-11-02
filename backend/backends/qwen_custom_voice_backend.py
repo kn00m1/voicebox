@@ -29,6 +29,7 @@ from .base import (
     model_load_progress,
 )
 from ..utils.hf_offline_patch import force_offline_if_cached
+from .mlx_backend import _get_tts_semaphore
 
 logger = logging.getLogger(__name__)
 
@@ -100,28 +101,40 @@ class QwenCustomVoiceBackend:
         is_cached = self._is_model_cached(model_size)
 
         with model_load_progress(model_name, is_cached):
+            from huggingface_hub import snapshot_download
             from qwen_tts import Qwen3TTSModel
+            from qwen_tts.core.models import Qwen3TTSConfig, Qwen3TTSForConditionalGeneration, Qwen3TTSProcessor
+            from transformers import AutoConfig, AutoProcessor
 
             model_path = self._get_model_path(model_size)
             logger.info("Loading Qwen CustomVoice %s on %s...", model_size, self.device)
 
-            with force_offline_if_cached(is_cached, model_name):
-                if self.device == "cpu":
-                    self.model = Qwen3TTSModel.from_pretrained(
-                        model_path,
-                        torch_dtype=torch.float32,
-                        low_cpu_mem_usage=False,
-                    )
-                else:
-                    self.model = Qwen3TTSModel.from_pretrained(
-                        model_path,
-                        device_map=self.device,
-                        torch_dtype=torch.bfloat16,
-                    )
+            # Resolve to local snapshot path — avoids the HF API metadata check
+            # that fires when from_pretrained receives a string repo ID
+            local_path = snapshot_download(model_path, local_files_only=True)
+
+            AutoConfig.register("qwen3_tts", Qwen3TTSConfig, exist_ok=True)
+            AutoProcessor.register(Qwen3TTSConfig, Qwen3TTSProcessor, exist_ok=True)
+
+            pt_model = Qwen3TTSForConditionalGeneration.from_pretrained(
+                local_path,
+                dtype=torch.bfloat16,
+                local_files_only=True,
+            )
+
+            processor = AutoProcessor.from_pretrained(local_path, fix_mistral_regex=True)
+            generate_defaults = pt_model.generate_config
+
+            device = self.device
+            pt_model = pt_model.to(device)
+
+            wrapper = Qwen3TTSModel(model=pt_model, processor=processor, generate_defaults=generate_defaults)
+            wrapper.device = torch.device(device)
+            self.model = wrapper
 
         self._current_model_size = model_size
         self.model_size = model_size
-        logger.info("Qwen CustomVoice %s loaded successfully", model_size)
+        logger.info("Qwen CustomVoice %s loaded successfully on %s", model_size, device)
 
     def unload_model(self) -> None:
         if self.model is not None:
@@ -213,5 +226,6 @@ class QwenCustomVoiceBackend:
                 wavs, sample_rate = self.model.generate_custom_voice(**kwargs)
             return wavs[0], sample_rate
 
-        audio, sample_rate = await asyncio.to_thread(_generate_sync)
+        async with _get_tts_semaphore():
+            audio, sample_rate = await asyncio.to_thread(_generate_sync)
         return audio, sample_rate

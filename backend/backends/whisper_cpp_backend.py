@@ -49,7 +49,7 @@ class WhisperCppSTTBackend:
 
     def __init__(self):
         self._loaded = False
-        self.model_size: Optional[str] = None
+        self.model_size: Optional[str] = "turbo"
         self._bin = _find_whisper_bin()
         self._models_dir = _find_models_dir()
 
@@ -107,34 +107,61 @@ class WhisperCppSTTBackend:
         Run whisper-cli on audio_path and return the transcript.
 
         whisper-cli is stateless — each call spawns a fresh process.
-        This matches what Thinking Out Loud does for final transcription.
+        Non-WAV formats (webm, opus, mp3, …) are converted to 16kHz mono
+        WAV via ffmpeg before the call, since whisper.cpp only reads PCM WAV.
         """
         await self.load_model(model_size or self.model_size or "turbo")
 
         size = model_size or self.model_size or "turbo"
         ggml_path = str(self._models_dir / GGML_MODEL_MAP[size])
 
-        cmd = [
-            str(self._bin),
-            "-m", ggml_path,
-            "-f", str(audio_path),
-            "-nt",          # no timestamps
-            "--no-prints",  # suppress progress output
-        ]
-        if language:
-            cmd += ["-l", language]
+        input_path = Path(audio_path)
+        wav_tmp: Optional[Path] = None
 
-        logger.debug("whisper-cli cmd: %s", " ".join(cmd))
+        if input_path.suffix.lower() != ".wav":
+            import tempfile
+            _fd, _wav_str = tempfile.mkstemp(suffix=".wav")
+            os.close(_fd)
+            wav_tmp = Path(_wav_str)
+            ffmpeg_proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-y", "-i", str(input_path),
+                "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
+                str(wav_tmp),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, ff_err = await ffmpeg_proc.communicate()
+            if ffmpeg_proc.returncode != 0:
+                raise RuntimeError(
+                    f"ffmpeg conversion failed: {ff_err.decode(errors='replace').strip()}"
+                )
+            input_path = wav_tmp
 
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
+        try:
+            cmd = [
+                str(self._bin),
+                "-m", ggml_path,
+                "-f", str(input_path),
+                "-nt",          # no timestamps
+                "--no-prints",  # suppress progress output
+            ]
+            if language:
+                cmd += ["-l", language]
 
-        if proc.returncode != 0:
-            err = stderr.decode(errors="replace").strip()
-            raise RuntimeError(f"whisper-cli exited {proc.returncode}: {err}")
+            logger.debug("whisper-cli cmd: %s", " ".join(cmd))
 
-        return stdout.decode(errors="replace").strip()
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+
+            if proc.returncode != 0:
+                err = stderr.decode(errors="replace").strip()
+                raise RuntimeError(f"whisper-cli exited {proc.returncode}: {err}")
+
+            return stdout.decode(errors="replace").strip()
+        finally:
+            if wav_tmp and wav_tmp.exists():
+                wav_tmp.unlink(missing_ok=True)

@@ -23,6 +23,17 @@ from ..utils.cache import get_cache_key, get_cached_voice_prompt, cache_voice_pr
 from ..utils.hf_offline_patch import force_offline_if_cached
 
 
+_tts_semaphore: Optional[asyncio.Semaphore] = None
+
+
+def _get_tts_semaphore() -> asyncio.Semaphore:
+    """Return a process-wide semaphore that serializes MPS inference."""
+    global _tts_semaphore
+    if _tts_semaphore is None:
+        _tts_semaphore = asyncio.Semaphore(1)
+    return _tts_semaphore
+
+
 class MLXTTSBackend:
     """MLX-based TTS backend using mlx-audio."""
 
@@ -88,23 +99,58 @@ class MLXTTSBackend:
     # Alias for compatibility
     load_model = load_model_async
 
+
     def _load_model_sync(self, model_size: str):
-        """Synchronous model loading."""
+        """Synchronous model loading via qwen_tts (PyTorch)."""
+        import torch
+        from safetensors.torch import load_file
+        from huggingface_hub import snapshot_download
+        from qwen_tts import Qwen3TTSModel
+        from qwen_tts.core.models import Qwen3TTSConfig, Qwen3TTSForConditionalGeneration, Qwen3TTSProcessor
+        from transformers import AutoConfig, AutoProcessor
+
         model_path = self._get_model_path(model_size)
         model_name = f"qwen-tts-{model_size}"
         is_cached = self._is_model_cached(model_size)
 
         with model_load_progress(model_name, is_cached):
-            from mlx_audio.tts import load
+            logger.info("Loading Qwen3 TTS model %s via qwen_tts (PyTorch)...", model_size)
+            local_path = snapshot_download(model_path, local_files_only=True)
 
-            logger.info("Loading MLX TTS model %s...", model_size)
+            AutoConfig.register("qwen3_tts", Qwen3TTSConfig, exist_ok=True)
+            AutoProcessor.register(Qwen3TTSConfig, Qwen3TTSProcessor, exist_ok=True)
 
-            with force_offline_if_cached(is_cached, model_name):
-                self.model = load(model_path)
+            # Step 1: Load model; MLX conv weights have mismatched shapes so skip them.
+            pt_model = Qwen3TTSForConditionalGeneration.from_pretrained(
+                local_path,
+                dtype=torch.bfloat16,
+                local_files_only=True,
+                ignore_mismatched_sizes=True,
+            )
+
+            # Step 2: Fix all 3D weights (MLX stores Conv1d as [out, kernel, in]; PyTorch expects [out, in, kernel]).
+            raw_weights = load_file(f"{local_path}/model.safetensors")
+            conv_fixes = {
+                k: v.permute(0, 2, 1).contiguous().to(torch.bfloat16)
+                for k, v in raw_weights.items()
+                if v.ndim == 3
+            }
+            pt_model.load_state_dict(conv_fixes, strict=False)
+            logger.info("Applied %d 3D weight transpositions for MLX→PyTorch", len(conv_fixes))
+
+            processor = AutoProcessor.from_pretrained(local_path, fix_mistral_regex=True)
+            generate_defaults = pt_model.generate_config
+
+            device = "mps" if torch.backends.mps.is_available() else "cpu"
+            pt_model = pt_model.to(device)
+
+            wrapper = Qwen3TTSModel(model=pt_model, processor=processor, generate_defaults=generate_defaults)
+            wrapper.device = torch.device(device)
+            self.model = wrapper
 
         self._current_model_size = model_size
         self.model_size = model_size
-        logger.info("MLX TTS model %s loaded successfully", model_size)
+        logger.info("Qwen3 TTS model %s loaded on %s", model_size, device)
 
     def unload_model(self):
         """Unload the model to free memory."""
@@ -193,79 +239,49 @@ class MLXTTSBackend:
 
         logger.info("Generating audio for text: %s", text)
 
-        model_name = f"qwen-tts-{self._current_model_size}"
-
         def _generate_sync():
             """Run synchronous generation in thread pool."""
-            # MLX generate() returns a generator yielding GenerationResult objects
-            audio_chunks = []
-            sample_rate = 24000
-            lang = LANGUAGE_CODE_TO_NAME.get(language, "auto")
+            import torch
 
-            # Set seed if provided (MLX uses numpy random)
-            if seed is not None:
-                import mlx.core as mx
-
-                np.random.seed(seed)
-                mx.random.seed(seed)
-
-            # Extract voice prompt info
             ref_audio = voice_prompt.get("ref_audio") or voice_prompt.get("ref_audio_path")
             ref_text = voice_prompt.get("ref_text", "")
 
-            # Validate that the audio file exists
             if ref_audio and not Path(ref_audio).exists():
-                logger.warning("Audio file not found: %s", ref_audio)
-                logger.warning("This may be due to a cached voice prompt referencing a deleted temp file.")
-                logger.warning("Regenerating without voice prompt.")
+                logger.warning("Audio file not found: %s — re-record voice profile", ref_audio)
                 ref_audio = None
 
-            # Model is loaded → weights are on disk. Force offline so
-            # lazy tokenizer/config lookups inside mlx_audio don't hang
-            # when the user is disconnected (issue #462).
-            with force_offline_if_cached(True, model_name):
-                # Check if model supports voice cloning via generate method
-                # MLX API may support ref_audio parameter directly
-                try:
-                    # Try with voice cloning parameters if supported
-                    if ref_audio:
-                        # Check if generate accepts ref_audio parameter
-                        import inspect
+            if ref_audio is None:
+                raise ValueError(
+                    "Voice prompt reference audio not found. "
+                    "Please re-record your voice profile."
+                )
 
-                        sig = inspect.signature(self.model.generate)
-                        if "ref_audio" in sig.parameters:
-                            # Generate with voice cloning
-                            for result in self.model.generate(text, ref_audio=ref_audio, ref_text=ref_text, lang_code=lang):
-                                audio_chunks.append(np.array(result.audio))
-                                sample_rate = result.sample_rate
-                        else:
-                            # Fallback: generate without voice cloning
-                            for result in self.model.generate(text, lang_code=lang):
-                                audio_chunks.append(np.array(result.audio))
-                                sample_rate = result.sample_rate
-                    else:
-                        # No voice prompt, generate normally
-                        for result in self.model.generate(text, lang_code=lang):
-                            audio_chunks.append(np.array(result.audio))
-                            sample_rate = result.sample_rate
-                except Exception as e:
-                    # If voice cloning fails, try without it
-                    logger.warning("Voice cloning failed, generating without voice prompt: %s", e)
-                    for result in self.model.generate(text, lang_code=lang):
-                        audio_chunks.append(np.array(result.audio))
-                        sample_rate = result.sample_rate
+            lang_name = LANGUAGE_CODE_TO_NAME.get(language, "Auto")
 
-            # Concatenate all chunks
-            if audio_chunks:
-                audio = np.concatenate([np.asarray(chunk, dtype=np.float32) for chunk in audio_chunks])
-            else:
-                # Fallback: empty audio
-                audio = np.array([], dtype=np.float32)
+            if seed is not None:
+                import random
+                torch.manual_seed(seed)
+                random.seed(seed)
+                np.random.seed(seed)
 
+            # ICL mode uses ref_text for better voice cloning; x-vector-only when no transcript
+            use_icl = bool(ref_text)
+
+            wavs, sample_rate = self.model.generate_voice_clone(
+                text=text,
+                language=lang_name,
+                ref_audio=ref_audio,
+                ref_text=ref_text if use_icl else None,
+                x_vector_only_mode=not use_icl,
+                non_streaming_mode=True,
+            )
+
+            audio = wavs[0].astype(np.float32) if wavs else np.array([], dtype=np.float32)
             return audio, sample_rate
 
-        # Run blocking inference in thread pool
-        audio, sample_rate = await asyncio.to_thread(_generate_sync)
+        # Serialize MPS inference — concurrent threads cause crashes on Apple Silicon
+        async with _get_tts_semaphore():
+            audio, sample_rate = await asyncio.to_thread(_generate_sync)
 
         return audio, sample_rate
 
